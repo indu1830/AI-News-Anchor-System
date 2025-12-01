@@ -1,0 +1,344 @@
+# Project Roles & Responsibilities for **AutoNews**
+
+Below is a clear 4-way split that keeps everyone highly technical while minimizing blockers. Each role owns a vertical slice but has well-defined hand-offs and shared standards.
+
+---
+
+## 1) **Backend & Orchestration Engineer**
+
+**Owner of:** Node.js 20 + Express API, cron/orchestration, integrations (GNews, YouTube), auth, logging, deployments (Railway/Render)
+
+**Primary scope**
+
+* Design and implement the REST API that the frontend and workers use.
+* Orchestrate the full pipeline (news → summary → TTS → video → publish) via Node-Cron.
+* Manage external services (GNews API, YouTube Data API v3) and secure secrets.
+
+**Core functionalities**
+
+* **API Contract (v1)**
+
+  * `POST /jobs` → create a generation job with params (topic, language, length, publish\:boolean).
+  * `GET /jobs/:id` → job status (queued, running, failed, complete) + artifact links.
+  * `GET /jobs` → paginated history with filters (date range, status, topic).
+  * `POST /jobs/:id/publish` → publish to YouTube (idempotent).
+  * `GET /health` → service healthcheck; `GET /metrics` → Prometheus-style metrics.
+* **Cron & Queue**
+
+  * Periodic `fetchTrending()` using **GNews**; de-duplicate by URL/hash.
+  * Create jobs for each picked article; push to worker endpoints (NLP, TTS, Video).
+  * Optional simple queue (in-DB state machine) with retry/backoff.
+* **Integrations**
+
+  * **GNews**: topic/category/region params; rate-limit + exponential backoff.
+  * **YouTube Data API v3**: upload, title/description/tags, privacy setting, thumbnail.
+* **Security & Ops**
+
+  * Token-based admin auth (JWT) for dashboard actions.
+  * Secrets via Railway/Render env vars; rotate keys.
+  * Structured logging (pino/winston), request tracing (request-id), error taxonomy.
+
+**Deliverables**
+
+* OpenAPI/Swagger spec for all endpoints.
+* Deployed backend (Railway/Render) with custom domain.
+* Cron jobs live; CI (GitHub Actions) for test→build→deploy.
+* Seed scripts and Postman/Bruno collection.
+
+**Success metrics**
+
+* 99%+ successful daily cron runs.
+* P95 API latency < 300 ms (non-render endpoints).
+* <1% job failure (excluding external outages), with auto-retries.
+
+**Key interfaces**
+
+* Calls **NLP & Audio** and **Video** services via HTTP (signed internal tokens).
+* Webhooks to **Frontend** for job-status updates (SSE/WebSocket optional).
+
+**Tech/tooling**
+
+* Node.js 20, Express, Node-Cron, Axios, Zod (validation), Prisma/SQLite or Postgres (Railway).
+* GitHub Actions, Render/Railway, OpenAPI/Swagger UI.
+
+**Risks & mitigations**
+
+* API rate limits → internal caching + backoff.
+* Long-running tasks → offload to worker services, timeouts + retries.
+
+---
+
+## 2) **NLP & Audio (TTS) Engineer**
+
+**Owner of:** Summarization service (Hugging Face Spaces), prompt & model configs, Coqui TTS service, text normalization, audio quality
+
+**Primary scope**
+
+* Build two independent microservices: **Summarizer** and **TTS**.
+* Ensure outputs are concise, factual, and speech-friendly.
+
+**Core functionalities**
+
+* **Summarization (HF Spaces)**
+
+  * Models: Flan-T5 or DistilBART, exposed via `/summarize` (inputs: title, article text, length\_hint).
+  * Abstractive summary with controllable length; factuality guardrails (source cross-check length/NER).
+  * Language support & domain prompts (e.g., “news-style”, “neutral tone”).
+  * Caching by article hash; fallback model if quota exceeded.
+* **Pre-speech Processing**
+
+  * Text normalization: numbers, dates, abbreviations; basic profanity filter.
+  * Prosody hints/SSML-like breaks (even if Coqui TTS doesn’t use SSML, emulate with punctuation).
+* **TTS (Coqui)**
+
+  * Endpoint `/tts` (inputs: text, voice\_id, speed, sample\_rate).
+  * Voice selection & consistency; loudness normalization, noise gate, de-esser.
+  * Output: 16-bit PCM WAV + duration metadata.
+* **Quality & Evaluation**
+
+  * ROUGE/BERTScore for internal checks; human spot-checks rubric.
+  * Store summary + audio QC flags; expose `/metrics`.
+
+**Deliverables**
+
+* Two live endpoints (Spaces for summarizer; small VM/Render for TTS).
+* Model cards, prompt docs, and a small benchmark report.
+* Audio style guide (voice, pace, pauses).
+
+**Success metrics**
+
+* Avg summary 60–120 words; >0.35 ROUGE-L vs source (internal).
+* TTS glitch rate < 0.5%; duration error < 3% vs text estimate.
+
+**Key interfaces**
+
+* Receives article payloads from **Backend**.
+* Provides WAV + timestamps to **Video**; returns summary + keypoints to **Frontend** preview.
+
+**Tech/tooling**
+
+* Python FastAPI (for TTS), Hugging Face Spaces (Gradio/FastAPI), Coqui TTS, Librosa, NumPy.
+
+**Risks & mitigations**
+
+* Hallucinations → tighter prompts, max summary length, highlight uncertainties.
+* TTS voice drift → lock voice profiles, checksum configs.
+
+---
+
+## 3) **Video/Media Pipeline Engineer**
+
+**Owner of:** Python MoviePy + FFmpeg rendering, scene templates, subtitles/thumbnails, media storage
+
+**Primary scope**
+
+* Convert (summary + audio + visuals) into a polished 16:9 video with branded templates, subtitles, and thumbnail.
+
+**Core functionalities**
+
+* **Rendering Service**
+
+  * Endpoint `/render` (inputs: summary text, audio URL, images/video snippets, theme).
+  * Compose: intro sting → anchor lower-third → headline → bullet wipe-ins → outro card.
+  * **Subtitles**: auto-generate SRT from text with TTS timings; burn-in optional.
+  * **Branding**: title safe-areas, fonts, color kit, logo animations.
+* **Assets**
+
+  * Pull images from article (GNews media URL) and/or royalty-free stock (pre-curated pack).
+  * Basic pan/zoom (Ken Burns), waveform overlay optional, gentle background bed (royalty-free).
+* **Performance & Reliability**
+
+  * Chunked rendering for long scripts; temp storage; resume on failure.
+  * Export presets: 1080p H.264 + AAC; optional 720p, and a square/vertical variant (stretch goal).
+* **Output**
+
+  * MP4 + cover thumbnail (JPEG/PNG), SRT (external) and burned-in variant.
+  * Return URLs to **Backend**; store in object storage (Railway volume, Cloudflare R2, or Render disk).
+
+**Deliverables**
+
+* Reusable video template(s) with theme config.
+* Deployed render microservice with queue awareness.
+* Thumbnail generator (title fit, 3 preset layouts).
+
+**Success metrics**
+
+* Render success > 98%; average 60–120s video produced < 2.5 min on std tier.
+* Lip/voice sync within 100 ms of subtitle cues.
+
+**Key interfaces**
+
+* Fetches audio + summary from **NLP & Audio** or Backend.
+* Returns MP4 + SRT + thumbnail URLs to **Backend** for publish.
+
+**Tech/tooling**
+
+* Python 3.11, FastAPI, MoviePy, FFmpeg, pysrt, PIL/Pillow.
+
+**Risks & mitigations**
+
+* Codec issues on hosts → static FFmpeg binary, codec sanity checks.
+* Copyright on media → whitelist sources, cache attributions.
+
+---
+
+## 4) **Frontend & UX Engineer**
+
+**Owner of:** React 18 + Tailwind + ShadCN UI, dashboard UX, job controls, media preview, Vercel deploy, docs site
+
+**Primary scope**
+
+* Build the operator-facing dashboard: create jobs, monitor pipeline, preview summaries and videos, toggle publishing.
+
+**Core functionalities**
+
+* **Screens**
+
+  * **Dashboard Home**: job table (status chips, filters, search), KPI cards (jobs today, success %, avg render time).
+  * **Create Job**: topic/language/length/publish toggle; validates against schema; posts to `/jobs`.
+  * **Job Detail**: live status (poll or SSE), logs view, artifacts: summary, audio player, subtitle preview, video player, publish actions.
+  * **Settings**: API keys (scoped), cron schedule presets, theme, voice selection.
+  * **Docs**: in-app “How it works” and runbooks.
+* **UX & Polish**
+
+  * Framer Motion micro-interactions; optimistic updates; error boundaries; skeleton loaders.
+  * Accessible components (ShadCN), keyboard navigation.
+* **Auth**
+
+  * Admin login; token storage (httpOnly cookie); role guard (viewer/operator/admin).
+* **Observability**
+
+  * Frontend telemetry (page loads, API errors), user-facing toasts mapped to server error codes.
+
+**Deliverables**
+
+* Deployed Vercel app with environment gating (dev/stage/prod).
+* Component library usage guide; Cypress E2E happy path.
+* Postman collection embedded as docs link.
+
+**Success metrics**
+
+* TTI < 2s on Vercel; Core Web Vitals “good”.
+* Zero critical UX blockers in weekly dogfooding.
+
+**Key interfaces**
+
+* Consumes Backend API; receives webhooks/SSE for status.
+* Streams artifacts (summary, audio, MP4) for preview.
+
+**Tech/tooling**
+
+* React 18, Vite/Next (choose one; Vercel favors Next), Tailwind, ShadCN UI, Framer Motion, React Query, Cypress, RTL/Vitest.
+
+**Risks & mitigations**
+
+* CORS/auth drift → shared OpenAPI types; Zod schema; strict CORS config.
+* Large MP4 preview → use HLS or ranged requests; show lightweight thumbnail + duration first.
+
+---
+
+## How these roles connect (handoffs)
+
+1. **Backend** pulls articles → creates **Jobs** → calls **Summarizer** → stores summary → calls **TTS** → stores WAV → calls **Video** → stores MP4/SRT → (optionally) calls **YouTube Publish** → marks job complete.
+2. **Frontend** kicks off manual jobs and monitors via `/jobs` + webhooks/SSE; previews summary/audio/video; can trigger publish.
+3. **Shared data models** (minimum):
+
+   * `Job`: id, topic, status, steps\[], error, createdAt/updatedAt.
+   * `Article`: id, source, url, title, content\_hash, media\_url.
+   * `Summary`: id, jobId, text, length, lang, quality\_flags.
+   * `Audio`: id, jobId, url, duration, sample\_rate.
+   * `Video`: id, jobId, url\_mp4, url\_srt, url\_thumb, width/height, duration.
+   * `Publish`: id, jobId, platform, videoId, status, publishAt.
+
+---
+
+## RACI (who drives what)
+
+| Area                                                      | Backend | NLP & Audio | Video | Frontend |
+| --------------------------------------------------------- | ------: | ----------: | ----: | -------: |
+| API design & auth                                         |   **R** |           C |     C |        C |
+| Cron/orchestration                                        |   **R** |           C |     C |        C |
+| GNews integration                                         |   **R** |           C |     C |        I |
+| Summarization svc                                         |       C |       **R** |     I |        I |
+| TTS svc                                                   |       C |       **R** |     C |        I |
+| Video rendering svc                                       |       C |           C | **R** |        I |
+| YouTube publishing                                        |   **R** |           I |     C |        C |
+| Dashboard UX                                              |       I |           I |     I |    **R** |
+| CI/CD pipelines                                           |   **R** |           C |     C |        C |
+| Observability                                             |   **R** |           C |     C |        C |
+| **R** = Responsible; **C** = Consulted; **I** = Informed. |         |             |       |          |
+
+---
+
+## Milestone plan (10–12 weeks, parallel where possible)
+
+* **Week 1–2**
+
+  * Backend: OpenAPI spec, scaffolding, DB schema.
+  * NLP: HF Space stub `/summarize`.
+  * Video: Render service skeleton, FFmpeg sanity.
+  * Frontend: Design system, auth scaffolding, jobs list stub.
+
+* **Week 3–4**
+
+  * Backend: GNews fetch + de-dupe; Job state machine; cron.
+  * NLP: Prompt tuning, caching; TTS MVP `/tts`.
+  * Video: Template #1, audio ingest, SRT gen.
+  * Frontend: Create Job flow; Job Detail live status (polling).
+
+* **Week 5–6**
+
+  * End-to-end “happy path” (manual job → MP4).
+  * Observability (logs, metrics); retries/backoff.
+  * Thumbnail generator; YouTube dry-run (unlisted).
+
+* **Week 7–8**
+
+  * Quality pass: summary rubric, audio polish, visual branding.
+  * Webhooks/SSE; error surfaces in UI; Cypress E2E.
+  * CI/CD hardening; staging + prod.
+
+* **Week 9–10**
+
+  * Automated daily cron + publish; content policy review.
+  * Performance tuning; cache hot paths.
+  * Documentation site + demo script.
+
+* **Week 11–12**
+
+  * Buffer for polish, report writing, and final presentation video.
+
+---
+
+## Collaboration & quality guardrails
+
+* **Branching**: `main` (protected), `feat/*`, `fix/*`; enforce PR reviews (2 approvals).
+* **Code quality**: ESLint/Prettier (JS), Ruff/Black (Py).
+* **Testing targets**:
+
+  * Backend (Jest): 70%+ statements; contract tests from OpenAPI.
+  * NLP/TTS (pytest): unit + golden files; latency budget checks.
+  * Video (pytest): render checksum, duration tolerances, smoke frames.
+  * Frontend (RTL/Cypress): critical flows (create job, view job, preview, publish).
+* **Runbooks**: “Job stuck”, “Rate-limit hit”, “YouTube quota exhausted”, “Render fails”.
+* **Compliance**: attribution handling for images; safe titles/descriptions; content guidelines.
+
+---
+
+## Stretch goals (assign after MVP)
+
+* Multi-language (hi/en/te) summaries & voices.
+* A/B templates; auto-choose by topic.
+* HLS output and chapter markers; vertical/shorts auto-cut.
+* Simple editorial rules engine (ban topics/keywords).
+
+---
+
+### TL;DR ownership
+
+* **Backend & Orchestration**: API, cron, GNews, YouTube, deployments, metrics.
+* **NLP & Audio**: Summaries that are short & factual, Coqui TTS audio that’s clean & consistent.
+* **Video/Media**: Branded, subtitle-accurate MP4s + thumbnails, reliable renders.
+* **Frontend & UX**: Crisp dashboard on Vercel with live status, previews, and admin controls.
+
+If you’d like, I can turn this into a one-page RFP/charter doc or a GitHub Projects board with issues pre-seeded for each role.
